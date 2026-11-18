@@ -71,6 +71,7 @@ typedef struct {
     char api_key[512];
     char model[128];
     int  max_tokens;
+    int  system_keyboard; // 1 = системная клавиатура Switch, 0 = встроенная
     char system[4096];
 } Config;
 
@@ -95,6 +96,8 @@ static void config_save(void) {
     fprintf(f, "# Модель: claude-sonnet-5-5, claude-opus-5-5, claude-haiku-5-5 ...\n");
     fprintf(f, "model=%s\n", g_cfg.model);
     fprintf(f, "max_tokens=%d\n", g_cfg.max_tokens);
+    fprintf(f, "# 1 = системная клавиатура Switch (на некоторых прошивках зависает), 0 = встроенная\n");
+    fprintf(f, "system_keyboard=%d\n", g_cfg.system_keyboard);
     fprintf(f, "# Системный промпт (одной строкой)\n");
     fprintf(f, "system=%s\n", g_cfg.system);
     fclose(f);
@@ -120,6 +123,7 @@ static void config_load(void) {
         if (!strcmp(key, "api_key")) snprintf(g_cfg.api_key, sizeof(g_cfg.api_key), "%s", val);
         else if (!strcmp(key, "model") && val[0]) snprintf(g_cfg.model, sizeof(g_cfg.model), "%s", val);
         else if (!strcmp(key, "max_tokens")) { int v = atoi(val); if (v > 0) g_cfg.max_tokens = v; }
+        else if (!strcmp(key, "system_keyboard")) g_cfg.system_keyboard = atoi(val);
         else if (!strcmp(key, "system")) snprintf(g_cfg.system, sizeof(g_cfg.system), "%s", val);
     }
     fclose(f);
@@ -728,9 +732,376 @@ static bool load_fonts(void) {
     return true;
 }
 
+
+// --------------------------------------------------------------------------
+// Встроенная экранная клавиатура (без системного апплета swkbd)
+// --------------------------------------------------------------------------
+
+typedef enum { K_CHAR, K_SHIFT, K_SYM, K_SPACE, K_BKSP, K_LANG, K_OK } KeyType;
+
+typedef struct {
+    SDL_Rect r;
+    KeyType type;
+    char text[24];
+    int row;
+} Key;
+
+enum { OSK_MSG = 0, OSK_KEY = 1 };
+
+static bool g_osk_active = false;
+static int  g_osk_mode = OSK_MSG;
+static char g_osk_buf[4096];
+static int  g_osk_lang = 0;      // 0 = RU, 1 = EN
+static bool g_osk_shift = false;
+static bool g_osk_sym = false;
+static Key  g_keys[80];
+static int  g_nkeys = 0;
+static int  g_osk_sel = 0;
+static bool g_osk_touching = false;
+static int  g_osk_hold_frames = 0;
+static u64  g_osk_hold_dir = 0;
+static int  g_osk_ver = 0; // меняется при изменении текста
+
+#define OSK_MAX_CHARS 1500
+
+// Кэш текстур подписей клавиш
+typedef struct { char label[24]; SDL_Texture *tex; int w, h; } LabelTex;
+static LabelTex g_label_cache[256];
+static int g_label_count = 0;
+
+static LabelTex *label_tex(const char *label) {
+    for (int i = 0; i < g_label_count; i++)
+        if (!strcmp(g_label_cache[i].label, label)) return &g_label_cache[i];
+    if (g_label_count >= (int)(sizeof(g_label_cache) / sizeof(g_label_cache[0]))) return NULL;
+    SDL_Surface *surf = TTF_RenderUTF8_Blended(g_font, label, (SDL_Color){240, 240, 245, 255});
+    if (!surf) return NULL;
+    LabelTex *lt = &g_label_cache[g_label_count];
+    snprintf(lt->label, sizeof(lt->label), "%s", label);
+    lt->tex = SDL_CreateTextureFromSurface(g_ren, surf);
+    lt->w = surf->w; lt->h = surf->h;
+    SDL_FreeSurface(surf);
+    if (!lt->tex) return NULL;
+    g_label_count++;
+    return lt;
+}
+
+#define KB_TOP 330
+#define KEY_H 64
+#define KEY_GAP 8
+
+static void osk_add_row_chars(const char *chars, int row) {
+    // считаем символы в строке
+    int n = 0;
+    for (const char *p = chars; *p; p += utf8_len((unsigned char)*p)) n++;
+    int kw = 88;
+    int total = n * kw + (n - 1) * KEY_GAP;
+    int x = (SCREEN_W - total) / 2;
+    int y = KB_TOP + row * (KEY_H + KEY_GAP);
+    for (const char *p = chars; *p; ) {
+        int l = utf8_len((unsigned char)*p);
+        Key *k = &g_keys[g_nkeys++];
+        k->r = (SDL_Rect){x, y, kw, KEY_H};
+        k->type = K_CHAR;
+        k->row = row;
+        memcpy(k->text, p, l);
+        k->text[l] = 0;
+        p += l;
+        x += kw + KEY_GAP;
+    }
+}
+
+static void osk_add_special(KeyType t, const char *label, int w, int *x, int row) {
+    Key *k = &g_keys[g_nkeys++];
+    k->r = (SDL_Rect){*x, KB_TOP + row * (KEY_H + KEY_GAP), w, KEY_H};
+    k->type = t;
+    k->row = row;
+    snprintf(k->text, sizeof(k->text), "%s", label);
+    *x += w + KEY_GAP;
+}
+
+static void osk_build(void) {
+    int keep_row = (g_osk_sel < g_nkeys) ? g_keys[g_osk_sel].row : 1;
+    int keep_x = (g_osk_sel < g_nkeys) ? g_keys[g_osk_sel].r.x + g_keys[g_osk_sel].r.w / 2 : SCREEN_W / 2;
+    g_nkeys = 0;
+    osk_add_row_chars("1234567890", 0);
+    if (g_osk_sym) {
+        osk_add_row_chars("!?@#$%&*()-+", 1);
+        osk_add_row_chars("_=:;\"'/\\<>", 2);
+        osk_add_row_chars("[]{}~^|`.,", 3);
+    } else if (g_osk_lang == 0) {
+        osk_add_row_chars(g_osk_shift ? "ЙЦУКЕНГШЩЗХЪ" : "йцукенгшщзхъ", 1);
+        osk_add_row_chars(g_osk_shift ? "ФЫВАПРОЛДЖЭ" : "фывапролджэ", 2);
+        osk_add_row_chars(g_osk_shift ? "ЯЧСМИТЬБЮЁ?!" : "ячсмитьбюё.,", 3);
+    } else {
+        osk_add_row_chars(g_osk_shift ? "QWERTYUIOP" : "qwertyuiop", 1);
+        osk_add_row_chars(g_osk_shift ? "ASDFGHJKL" : "asdfghjkl", 2);
+        osk_add_row_chars(g_osk_shift ? "ZXCVBNM?!" : "zxcvbnm.,", 3);
+    }
+    // нижний ряд
+    int widths[6] = {130, 130, 420, 170, 130, 190};
+    int total = 0;
+    for (int i = 0; i < 6; i++) total += widths[i];
+    total += 5 * KEY_GAP;
+    int x = (SCREEN_W - total) / 2;
+    osk_add_special(K_SHIFT, "Aa", widths[0], &x, 4);
+    osk_add_special(K_SYM, g_osk_sym ? "абв" : "?123", widths[1], &x, 4);
+    osk_add_special(K_SPACE, "Пробел", widths[2], &x, 4);
+    osk_add_special(K_BKSP, "Стереть", widths[3], &x, 4);
+    osk_add_special(K_LANG, g_osk_lang == 0 ? "EN" : "RU", widths[4], &x, 4);
+    osk_add_special(K_OK, "Готово", widths[5], &x, 4);
+
+    // восстанавливаем выделение примерно на том же месте
+    int best = 0, bestd = 1 << 30;
+    for (int i = 0; i < g_nkeys; i++) {
+        if (g_keys[i].row != keep_row) continue;
+        int d = abs(g_keys[i].r.x + g_keys[i].r.w / 2 - keep_x);
+        if (d < bestd) { bestd = d; best = i; }
+    }
+    g_osk_sel = best;
+}
+
+static int osk_char_count(void) {
+    int n = 0;
+    for (const char *p = g_osk_buf; *p; p += utf8_len((unsigned char)*p)) n++;
+    return n;
+}
+
+static void osk_insert(const char *t) {
+    size_t len = strlen(g_osk_buf), tl = strlen(t);
+    if (len + tl + 1 >= sizeof(g_osk_buf) || osk_char_count() >= OSK_MAX_CHARS) return;
+    memcpy(g_osk_buf + len, t, tl + 1);
+    g_osk_ver++;
+}
+
+static void osk_backspace(void) {
+    size_t len = strlen(g_osk_buf);
+    if (!len) return;
+    size_t i = len - 1;
+    while (i > 0 && ((unsigned char)g_osk_buf[i] & 0xC0) == 0x80) i--;
+    g_osk_buf[i] = 0;
+    g_osk_ver++;
+}
+
+static void osk_open(int mode) {
+    LOG("osk_open %d", mode);
+    g_osk_mode = mode;
+    g_osk_buf[0] = 0;
+    g_osk_ver++;
+    g_osk_shift = false;
+    g_osk_sym = false;
+    if (mode == OSK_KEY) g_osk_lang = 1;
+    g_osk_sel = 0;
+    g_nkeys = 0;
+    osk_build();
+    // выделяем первую букву
+    for (int i = 0; i < g_nkeys; i++) if (g_keys[i].row == 1) { g_osk_sel = i; break; }
+    g_osk_touching = true; // не реагировать на касание, которым открыли клавиатуру
+    g_osk_active = true;
+}
+
+static void osk_finish(bool ok);
+
+static void osk_press(int idx) {
+    if (idx < 0 || idx >= g_nkeys) return;
+    Key *k = &g_keys[idx];
+    switch (k->type) {
+        case K_CHAR:
+            osk_insert(k->text);
+            if (g_osk_shift && !g_osk_sym) { g_osk_shift = false; osk_build(); }
+            break;
+        case K_SHIFT: g_osk_shift = !g_osk_shift; osk_build(); break;
+        case K_SYM:   g_osk_sym = !g_osk_sym; osk_build(); break;
+        case K_SPACE: osk_insert(" "); break;
+        case K_BKSP:  osk_backspace(); break;
+        case K_LANG:  g_osk_lang = !g_osk_lang; g_osk_sym = false; osk_build(); break;
+        case K_OK:    osk_finish(true); break;
+    }
+}
+
+static void osk_move(int dx, int dy) {
+    Key *cur = &g_keys[g_osk_sel];
+    if (dx) {
+        int n = g_osk_sel + dx;
+        if (n >= 0 && n < g_nkeys && g_keys[n].row == cur->row) g_osk_sel = n;
+        return;
+    }
+    int row = cur->row + dy;
+    if (row < 0 || row > 4) return;
+    int cx = cur->r.x + cur->r.w / 2;
+    int best = -1, bestd = 1 << 30;
+    for (int i = 0; i < g_nkeys; i++) {
+        if (g_keys[i].row != row) continue;
+        int d = abs(g_keys[i].r.x + g_keys[i].r.w / 2 - cx);
+        if (d < bestd) { bestd = d; best = i; }
+    }
+    if (best >= 0) g_osk_sel = best;
+}
+
+static void osk_update(u64 down, u64 held, HidTouchScreenState *ts) {
+    if (down & HidNpadButton_Minus) { osk_finish(false); return; }
+    if (down & HidNpadButton_Plus)  { osk_finish(true); return; }
+    if (down & HidNpadButton_A) { osk_press(g_osk_sel); if (!g_osk_active) return; }
+    if (down & HidNpadButton_B) osk_backspace();
+    if (down & HidNpadButton_Y) osk_insert(" ");
+    if (down & HidNpadButton_X) { g_osk_lang = !g_osk_lang; g_osk_sym = false; osk_build(); }
+    if (down & (HidNpadButton_L | HidNpadButton_ZL)) { g_osk_shift = !g_osk_shift; osk_build(); }
+    if (down & (HidNpadButton_R | HidNpadButton_ZR)) { g_osk_sym = !g_osk_sym; osk_build(); }
+
+    // перемещение с автоповтором
+    const u64 dirs = HidNpadButton_AnyLeft | HidNpadButton_AnyRight | HidNpadButton_AnyUp | HidNpadButton_AnyDown;
+    u64 dir = held & dirs;
+    if (dir) {
+        bool fire = false;
+        if (dir != g_osk_hold_dir) { g_osk_hold_dir = dir; g_osk_hold_frames = 0; fire = true; }
+        else { g_osk_hold_frames++; if (g_osk_hold_frames > 18 && (g_osk_hold_frames % 5) == 0) fire = true; }
+        if (fire) {
+            if (dir & HidNpadButton_AnyLeft) osk_move(-1, 0);
+            else if (dir & HidNpadButton_AnyRight) osk_move(1, 0);
+            else if (dir & HidNpadButton_AnyUp) osk_move(0, -1);
+            else if (dir & HidNpadButton_AnyDown) osk_move(0, 1);
+        }
+    } else {
+        g_osk_hold_dir = 0;
+    }
+
+    // касание: нажатие срабатывает в момент прикосновения
+    if (ts->count > 0) {
+        if (!g_osk_touching) {
+            int tx = ts->touches[0].x, ty = ts->touches[0].y;
+            for (int i = 0; i < g_nkeys; i++) {
+                SDL_Rect *r = &g_keys[i].r;
+                if (tx >= r->x && tx < r->x + r->w && ty >= r->y && ty < r->y + r->h) {
+                    g_osk_sel = i;
+                    osk_press(i);
+                    break;
+                }
+            }
+        }
+        g_osk_touching = true;
+    } else {
+        g_osk_touching = false;
+    }
+}
+
+static void osk_render(u64 frame) {
+    SDL_SetRenderDrawColor(g_ren, 24, 24, 28, 255);
+    SDL_RenderClear(g_ren);
+
+    // шапка
+    fill_rect(0, 0, SCREEN_W, HEADER_H, 36, 36, 42);
+    fill_rect(0, HEADER_H - 2, SCREEN_W, 2, 217, 119, 87);
+    const char *title = g_osk_mode == OSK_KEY ? "API-ключ Anthropic" : "Сообщение для Claude";
+    draw_text(g_font_bold, title, MARGIN_X, (HEADER_H - TTF_FontHeight(g_font_bold)) / 2, (SDL_Color){230, 150, 100, 255});
+    char cnt[64];
+    snprintf(cnt, sizeof(cnt), "%d / %d   %s", osk_char_count(), OSK_MAX_CHARS, g_osk_sym ? "?123" : (g_osk_lang == 0 ? "RU" : "EN"));
+    draw_text(g_font_small, cnt, SCREEN_W - MARGIN_X - text_w(g_font_small, cnt),
+              (HEADER_H - TTF_FontHeight(g_font_small)) / 2, (SDL_Color){160, 160, 170, 255});
+
+    // поле ввода: показываем последние строки текста
+    int box_y = HEADER_H + 12, box_h = KB_TOP - box_y - 16;
+    fill_rect(MARGIN_X - 10, box_y, SCREEN_W - 2 * (MARGIN_X - 10), box_h, 40, 40, 48);
+    int lh = TTF_FontLineSkip(g_font);
+    int max_lines = (box_h - 16) / lh;
+    int maxw = SCREEN_W - 2 * MARGIN_X - 20;
+    // разбиваем текст на строки (по ширине), запоминаем начала строк
+    static int starts[2048];
+    static int nl = 0;
+    static int cached_ver = -1;
+    const char *t = g_osk_buf;
+    size_t len = strlen(t);
+    if (cached_ver != g_osk_ver) {
+        cached_ver = g_osk_ver;
+        size_t pos = 0;
+        nl = 0;
+        starts[nl++] = 0;
+        while (pos < len && nl < 2047) {
+            size_t i = pos, last_ok = pos;
+            while (i < len) {
+                size_t nx = i + utf8_len((unsigned char)t[i]);
+                if (text_width(g_font, t + pos, nx - pos) > maxw) break;
+                last_ok = nx;
+                i = nx;
+            }
+            if (i >= len) break;
+            if (last_ok == pos) last_ok = pos + utf8_len((unsigned char)t[pos]);
+            pos = last_ok;
+            starts[nl++] = (int)pos;
+        }
+    }
+    int first = nl > max_lines ? nl - max_lines : 0;
+    for (int l = first; l < nl; l++) {
+        int a = starts[l], b = (l + 1 < nl) ? starts[l + 1] : (int)len;
+        char line[1024];
+        int n = b - a; if (n > 1000) n = 1000;
+        memcpy(line, t + a, n); line[n] = 0;
+        bool last = (l == nl - 1);
+        if (last && (frame / 30) % 2 == 0) strcat(line, "|");
+        if (line[0]) draw_text(g_font, line, MARGIN_X, box_y + 8 + (l - first) * lh, (SDL_Color){240, 240, 240, 255});
+    }
+    if (!g_osk_buf[0]) {
+        const char *ph = g_osk_mode == OSK_KEY ? "Введи ключ sk-ant-... (проще вписать его в config.txt на ПК)" : "Набери сообщение...";
+        draw_text(g_font, ph, MARGIN_X + 14, box_y + 8, (SDL_Color){120, 120, 130, 255});
+    }
+
+    // клавиши
+    for (int i = 0; i < g_nkeys; i++) {
+        Key *k = &g_keys[i];
+        bool sel = (i == g_osk_sel);
+        bool special = k->type != K_CHAR;
+        bool active = (k->type == K_SHIFT && g_osk_shift) || (k->type == K_SYM && g_osk_sym);
+        if (sel) fill_rect(k->r.x - 3, k->r.y - 3, k->r.w + 6, k->r.h + 6, 230, 150, 100);
+        if (k->type == K_OK) fill_rect(k->r.x, k->r.y, k->r.w, k->r.h, 160, 90, 60);
+        else if (active) fill_rect(k->r.x, k->r.y, k->r.w, k->r.h, 80, 110, 170);
+        else if (special) fill_rect(k->r.x, k->r.y, k->r.w, k->r.h, 52, 52, 62);
+        else fill_rect(k->r.x, k->r.y, k->r.w, k->r.h, 66, 66, 78);
+        LabelTex *lt = label_tex(k->text);
+        if (lt) {
+            SDL_Rect dst = {k->r.x + (k->r.w - lt->w) / 2, k->r.y + (k->r.h - lt->h) / 2, lt->w, lt->h};
+            SDL_RenderCopy(g_ren, lt->tex, NULL, &dst);
+        }
+    }
+
+    // подсказка
+    fill_rect(0, SCREEN_H - 34, SCREEN_W, 34, 36, 36, 42);
+    const char *hint = "A — нажать   B — стереть   Y — пробел   X — RU/EN   L — Aa   R — ?123   + — готово   − — отмена";
+    draw_text(g_font_small, hint, MARGIN_X, SCREEN_H - 34 + (34 - TTF_FontHeight(g_font_small)) / 2, (SDL_Color){170, 170, 180, 255});
+
+    SDL_RenderPresent(g_ren);
+}
+
 // --------------------------------------------------------------------------
 // main
 // --------------------------------------------------------------------------
+
+static void submit_message(const char *text) {
+    msg_add(ROLE_USER, text);
+    if (!request_start()) {
+        g_msgs[g_msg_count - 1].excluded = true;
+        msg_add(ROLE_ERROR, "Не удалось запустить сетевой поток.");
+    }
+    layout_all();
+    g_stick_bottom = true;
+}
+
+static void save_api_key(const char *key) {
+    snprintf(g_cfg.api_key, sizeof(g_cfg.api_key), "%s", key);
+    config_save();
+    msg_add(ROLE_INFO, "API-ключ сохранён в sdmc:/switch/claude/config.txt");
+    layout_all();
+    g_stick_bottom = true;
+}
+
+static void osk_finish(bool ok) {
+    LOG("osk_finish %d", (int)ok);
+    g_osk_active = false;
+    if (!ok) return;
+    char tmp[sizeof(g_osk_buf)];
+    snprintf(tmp, sizeof(tmp), "%s", g_osk_buf);
+    trim(tmp);
+    if (!tmp[0]) return;
+    if (g_osk_mode == OSK_KEY) save_api_key(tmp);
+    else submit_message(tmp);
+}
 
 static void send_message(void) {
     if (g_busy) return;
@@ -741,35 +1112,31 @@ static void send_message(void) {
         g_stick_bottom = true;
         return;
     }
-    static char input[8192];
-    if (!ask_text("Сообщение для Claude", "Напиши сообщение...", NULL, input, sizeof(input), 500, false)) return;
-    msg_add(ROLE_USER, input);
-    if (!request_start()) {
-        g_msgs[g_msg_count - 1].excluded = true;
-        msg_add(ROLE_ERROR, "Не удалось запустить сетевой поток.");
+    if (g_cfg.system_keyboard) {
+        static char input[8192];
+        if (ask_text("Сообщение для Claude", "Напиши сообщение...", NULL, input, sizeof(input), 500, false))
+            submit_message(input);
+        return;
     }
-    layout_all();
-    g_stick_bottom = true;
+    osk_open(OSK_MSG);
 }
 
 static void enter_api_key(void) {
     if (g_busy) return;
     LOG("Y pressed");
-    static char key[600];
-    if (ask_text("API-ключ Anthropic", "sk-ant-...", NULL, key, sizeof(key), 300, true)) {
-        snprintf(g_cfg.api_key, sizeof(g_cfg.api_key), "%s", key);
-        config_save();
-        msg_add(ROLE_INFO, "API-ключ сохранён в sdmc:/switch/claude/config.txt");
-        layout_all();
-        g_stick_bottom = true;
+    if (g_cfg.system_keyboard) {
+        static char key[600];
+        if (ask_text("API-ключ Anthropic", "sk-ant-...", NULL, key, sizeof(key), 300, true)) save_api_key(key);
+        return;
     }
+    osk_open(OSK_KEY);
 }
 
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
 
     remove("sdmc:/switch/claude/log.txt");
-    LOG("claude-nx 1.0.2 start, applet type %d", (int)appletGetAppletType());
+    LOG("claude-nx 1.0.3 start, applet type %d", (int)appletGetAppletType());
 
     Result rc = socketInitializeDefault();
     LOG("socketInitializeDefault: 0x%x", rc);
@@ -850,13 +1217,22 @@ int main(int argc, char **argv) {
         u64 down = padGetButtonsDown(&pad);
         u64 held = padGetButtons(&pad);
 
-        if (down & HidNpadButton_Plus) break;
-
         if (g_busy && g_req.done) {
             request_finish();
             layout_all();
             g_stick_bottom = true;
         }
+
+        if (g_osk_active) {
+            HidTouchScreenState ots = {0};
+            hidGetTouchScreenStates(&ots, 1);
+            osk_update(down, held, &ots);
+            if (g_osk_active) { osk_render(frame); continue; }
+            // клавиатуру только что закрыли — не обрабатываем эти же нажатия в чате
+            down = 0;
+        }
+
+        if (down & HidNpadButton_Plus) break;
 
         if (down & HidNpadButton_A) send_message();
         if ((down & HidNpadButton_X) && !g_busy) {
@@ -866,6 +1242,7 @@ int main(int argc, char **argv) {
             g_scroll = 0;
         }
         if (down & HidNpadButton_Y) enter_api_key();
+        if (g_osk_active) continue;
 
         // Прокрутка
         float dy = 0;
