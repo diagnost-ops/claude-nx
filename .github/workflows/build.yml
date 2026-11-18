@@ -1,0 +1,22 @@
+name: Build claude-nx
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkita64:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch cJSON
+        run: |
+          git clone --depth 1 --branch v1.7.18 https://github.com/DaveGamble/cJSON /tmp/cJSON
+          cp /tmp/cJSON/cJSON.c /tmp/cJSON/cJSON.h source/
+      - name: Build
+        run: make -j$(nproc)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: claude-nx
+          path: claude-nx.nro
