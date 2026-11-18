@@ -22,6 +22,23 @@
 
 #include "cJSON.h"
 
+// --------------------------------------------------------------------------
+// Журнал запуска: sdmc:/switch/claude/log.txt (каждая строка сразу сохраняется на карту)
+// --------------------------------------------------------------------------
+#include <stdarg.h>
+static void logf_(const char *fmt, ...) {
+    mkdir("sdmc:/switch", 0777);
+    mkdir("sdmc:/switch/claude", 0777);
+    FILE *f = fopen("sdmc:/switch/claude/log.txt", "a");
+    if (!f) return;
+    u64 ms = armTicksToNs(armGetSystemTick()) / 1000000ULL;
+    fprintf(f, "[%llu ms] ", (unsigned long long)ms);
+    va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
+#define LOG(...) logf_(__VA_ARGS__)
+
 #define SCREEN_W 1280
 #define SCREEN_H 720
 
@@ -279,6 +296,7 @@ static char *build_request_body(void) {
 }
 
 static bool request_start(void) {
+    LOG("request_start");
     free(g_req.body);
     free(g_req.resp);
     memset(&g_req, 0, sizeof(g_req));
@@ -305,6 +323,7 @@ static void strip_markdown_bold(char *s) {
 
 // Вызывается из главного потока, когда запрос завершён
 static void request_finish(void) {
+    LOG("request_finish: curl %d http %ld", (int)g_req.curl_rc, g_req.http_code);
     threadWaitForExit(&g_req_thread);
     threadClose(&g_req_thread);
     g_busy = false;
@@ -383,7 +402,9 @@ static bool ask_text(const char *header, const char *guide, const char *initial,
                      char *out, size_t out_size, u32 max_chars, bool password) {
     SwkbdConfig kbd;
     out[0] = 0;
-    if (R_FAILED(swkbdCreate(&kbd, 0))) return false;
+    Result crc = swkbdCreate(&kbd, 0);
+    LOG("swkbdCreate: 0x%x", crc);
+    if (R_FAILED(crc)) return false;
     if (password) swkbdConfigMakePresetPassword(&kbd);
     else swkbdConfigMakePresetDefault(&kbd);
     swkbdConfigSetType(&kbd, password ? SwkbdType_QWERTY : SwkbdType_All); // все раскладки, включая русскую
@@ -394,7 +415,9 @@ static bool ask_text(const char *header, const char *guide, const char *initial,
     swkbdConfigSetStringLenMax(&kbd, max_chars);
     swkbdConfigSetTextDrawType(&kbd, SwkbdTextDrawType_Box);
     if (!password) swkbdConfigSetReturnButtonFlag(&kbd, 1);
+    LOG("swkbdShow...");
     Result rc = swkbdShow(&kbd, out, out_size);
+    LOG("swkbdShow: 0x%x", rc);
     swkbdClose(&kbd);
     if (R_FAILED(rc)) { out[0] = 0; return false; }
     trim(out);
@@ -713,6 +736,7 @@ static bool load_fonts(void) {
 
 static void send_message(void) {
     if (g_busy) return;
+    LOG("A pressed");
     if (!g_cfg.api_key[0]) {
         msg_add(ROLE_ERROR, "Не задан API-ключ. Нажми Y, чтобы ввести его, или впиши api_key=... в sdmc:/switch/claude/config.txt");
         layout_all();
@@ -745,27 +769,57 @@ static void enter_api_key(void) {
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
 
-    socketInitializeDefault();
-    plInitialize(PlServiceType_User);
+    remove("sdmc:/switch/claude/log.txt");
+    LOG("claude-nx 1.0.1 start, applet type %d", (int)appletGetAppletType());
 
-    curl_global_init(CURL_GLOBAL_DEFAULT);
+    Result rc = socketInitializeDefault();
+    LOG("socketInitializeDefault: 0x%x", rc);
+    rc = plInitialize(PlServiceType_User);
+    LOG("plInitialize: 0x%x", rc);
 
-    SDL_Init(SDL_INIT_VIDEO);
-    TTF_Init();
+    CURLcode cc = curl_global_init(CURL_GLOBAL_DEFAULT);
+    LOG("curl_global_init: %d", (int)cc);
+
+    int sr = SDL_Init(SDL_INIT_VIDEO);
+    LOG("SDL_Init: %d %s", sr, sr ? SDL_GetError() : "");
+    sr = TTF_Init();
+    LOG("TTF_Init: %d", sr);
     SDL_Window *win = SDL_CreateWindow("Claude", 0, 0, SCREEN_W, SCREEN_H, SDL_WINDOW_SHOWN);
+    LOG("SDL_CreateWindow: %p %s", (void*)win, win ? "" : SDL_GetError());
     g_ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    LOG("SDL_CreateRenderer: %p %s", (void*)g_ren, g_ren ? "" : SDL_GetError());
+    if (!win || !g_ren) { LOG("no window/renderer, exit"); SDL_Quit(); socketExit(); return 1; }
     SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
+    // Тёмно-синий экран = графика заработала
+    SDL_SetRenderDrawColor(g_ren, 20, 30, 60, 255);
+    SDL_RenderClear(g_ren);
+    SDL_RenderPresent(g_ren);
+    LOG("first present ok");
 
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     PadState pad;
     padInitializeDefault(&pad);
     hidInitializeTouchScreen();
+    LOG("input ok");
 
     config_load();
+    LOG("config_load ok, key %s, model %s", g_cfg.api_key[0] ? "set" : "empty", g_cfg.model);
     bool fonts_ok = load_fonts();
+    LOG("load_fonts: %d", (int)fonts_ok);
+    if (fonts_ok) {
+        LOG("cyrillic glyph: %d", TTF_GlyphIsProvided(g_font, 0x0416));
+    }
 
     if (!fonts_ok) {
-        // Без шрифта нечего рисовать — выходим аккуратно
+        LOG("font error: %s", TTF_GetError());
+        // Красный экран = не удалось загрузить шрифт; ждём нажатия + для выхода
+        while (appletMainLoop()) {
+            padUpdate(&pad);
+            if (padGetButtonsDown(&pad) & HidNpadButton_Plus) break;
+            SDL_SetRenderDrawColor(g_ren, 120, 20, 20, 255);
+            SDL_RenderClear(g_ren);
+            SDL_RenderPresent(g_ren);
+        }
         SDL_DestroyRenderer(g_ren);
         SDL_DestroyWindow(win);
         TTF_Quit();
@@ -777,8 +831,10 @@ int main(int argc, char **argv) {
     }
 
     history_load();
+    LOG("history_load: %d msgs", g_msg_count);
     if (g_msg_count > 0) msg_add(ROLE_INFO, "(Продолжение прошлого чата. X — начать новый.)");
     layout_all();
+    LOG("layout ok, entering main loop");
 
     bool touching = false;
     int touch_last_y = 0;
@@ -787,6 +843,10 @@ int main(int argc, char **argv) {
 
     while (appletMainLoop()) {
         frame++;
+        SDL_Event ev;
+        bool quit = false;
+        while (SDL_PollEvent(&ev)) if (ev.type == SDL_QUIT) quit = true;
+        if (quit) break;
         padUpdate(&pad);
         u64 down = padGetButtonsDown(&pad);
         u64 held = padGetButtons(&pad);
@@ -846,7 +906,9 @@ int main(int argc, char **argv) {
         clamp_scroll();
 
         render(frame);
+        if (frame == 1 || frame == 60) LOG("frame %llu rendered", (unsigned long long)frame);
     }
+    LOG("main loop exit");
 
     if (g_busy) {
         // Прерываем запрос и ждём завершения сетевого потока
