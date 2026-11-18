@@ -405,16 +405,14 @@ static bool ask_text(const char *header, const char *guide, const char *initial,
     Result crc = swkbdCreate(&kbd, 0);
     LOG("swkbdCreate: 0x%x", crc);
     if (R_FAILED(crc)) return false;
-    if (password) swkbdConfigMakePresetPassword(&kbd);
-    else swkbdConfigMakePresetDefault(&kbd);
-    swkbdConfigSetType(&kbd, password ? SwkbdType_QWERTY : SwkbdType_All); // все раскладки, включая русскую
+    // Только стандартные настройки: нестандартные (тип «все раскладки», Box, перенос строки,
+    // режим пароля) приводили к зависанию клавиатуры на прошивке пользователя
+    swkbdConfigMakePresetDefault(&kbd);
+    (void)password;
     if (header) swkbdConfigSetHeaderText(&kbd, header);
     if (guide) swkbdConfigSetGuideText(&kbd, guide);
     if (initial) swkbdConfigSetInitialText(&kbd, initial);
-    swkbdConfigSetOkButtonText(&kbd, password ? "Сохранить" : "Отправить");
     swkbdConfigSetStringLenMax(&kbd, max_chars);
-    swkbdConfigSetTextDrawType(&kbd, SwkbdTextDrawType_Box);
-    if (!password) swkbdConfigSetReturnButtonFlag(&kbd, 1);
     LOG("swkbdShow...");
     Result rc = swkbdShow(&kbd, out, out_size);
     LOG("swkbdShow: 0x%x", rc);
@@ -744,7 +742,7 @@ static void send_message(void) {
         return;
     }
     static char input[8192];
-    if (!ask_text("Сообщение для Claude", "Напиши сообщение...", NULL, input, sizeof(input), 2000, false)) return;
+    if (!ask_text("Сообщение для Claude", "Напиши сообщение...", NULL, input, sizeof(input), 500, false)) return;
     msg_add(ROLE_USER, input);
     if (!request_start()) {
         g_msgs[g_msg_count - 1].excluded = true;
@@ -756,6 +754,7 @@ static void send_message(void) {
 
 static void enter_api_key(void) {
     if (g_busy) return;
+    LOG("Y pressed");
     static char key[600];
     if (ask_text("API-ключ Anthropic", "sk-ant-...", NULL, key, sizeof(key), 300, true)) {
         snprintf(g_cfg.api_key, sizeof(g_cfg.api_key), "%s", key);
@@ -770,7 +769,7 @@ int main(int argc, char **argv) {
     (void)argc; (void)argv;
 
     remove("sdmc:/switch/claude/log.txt");
-    LOG("claude-nx 1.0.1 start, applet type %d", (int)appletGetAppletType());
+    LOG("claude-nx 1.0.2 start, applet type %d", (int)appletGetAppletType());
 
     Result rc = socketInitializeDefault();
     LOG("socketInitializeDefault: 0x%x", rc);
