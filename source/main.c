@@ -72,6 +72,8 @@ typedef struct {
     char model[128];
     int  max_tokens;
     int  system_keyboard; // 1 = системная клавиатура Switch, 0 = встроенная
+    char server[256];       // адрес моста на ПК, например http://192.168.1.10:8787/v1/messages
+    char server_token[128]; // токен моста
     char system[4096];
 } Config;
 
@@ -96,6 +98,10 @@ static void config_save(void) {
     fprintf(f, "# Модель: claude-sonnet-5-5, claude-opus-5-5, claude-haiku-5-5 ...\n");
     fprintf(f, "model=%s\n", g_cfg.model);
     fprintf(f, "max_tokens=%d\n", g_cfg.max_tokens);
+    fprintf(f, "# Режим «через компьютер» (подписка Claude Pro через Claude Code на ПК).\n");
+    fprintf(f, "# Если server задан, api_key не нужен. Пусто = напрямую через Anthropic API.\n");
+    fprintf(f, "server=%s\n", g_cfg.server);
+    fprintf(f, "server_token=%s\n", g_cfg.server_token);
     fprintf(f, "# 1 = системная клавиатура Switch (на некоторых прошивках зависает), 0 = встроенная\n");
     fprintf(f, "system_keyboard=%d\n", g_cfg.system_keyboard);
     fprintf(f, "# Системный промпт (одной строкой)\n");
@@ -124,6 +130,8 @@ static void config_load(void) {
         else if (!strcmp(key, "model") && val[0]) snprintf(g_cfg.model, sizeof(g_cfg.model), "%s", val);
         else if (!strcmp(key, "max_tokens")) { int v = atoi(val); if (v > 0) g_cfg.max_tokens = v; }
         else if (!strcmp(key, "system_keyboard")) g_cfg.system_keyboard = atoi(val);
+        else if (!strcmp(key, "server")) snprintf(g_cfg.server, sizeof(g_cfg.server), "%s", val);
+        else if (!strcmp(key, "server_token")) snprintf(g_cfg.server_token, sizeof(g_cfg.server_token), "%s", val);
         else if (!strcmp(key, "system")) snprintf(g_cfg.system, sizeof(g_cfg.system), "%s", val);
     }
     fclose(f);
@@ -250,14 +258,15 @@ static void request_thread(void *arg) {
         r->done = true;
         return;
     }
+    bool via_pc = g_cfg.server[0] != 0;
     char keyhdr[600];
-    snprintf(keyhdr, sizeof(keyhdr), "x-api-key: %s", g_cfg.api_key);
+    snprintf(keyhdr, sizeof(keyhdr), "x-api-key: %s", via_pc ? g_cfg.server_token : g_cfg.api_key);
     struct curl_slist *h = NULL;
     h = curl_slist_append(h, "content-type: application/json");
     h = curl_slist_append(h, "anthropic-version: 2023-06-01");
     h = curl_slist_append(h, keyhdr);
 
-    curl_easy_setopt(c, CURLOPT_URL, API_URL);
+    curl_easy_setopt(c, CURLOPT_URL, via_pc ? g_cfg.server : API_URL);
     curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
     curl_easy_setopt(c, CURLOPT_POSTFIELDS, r->body);
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
@@ -337,8 +346,9 @@ static void request_finish(void) {
 
     if (g_req.curl_rc != CURLE_OK) {
         char buf[512];
-        snprintf(buf, sizeof(buf), "Ошибка сети: %s",
-                 g_req.curl_err[0] ? g_req.curl_err : curl_easy_strerror(g_req.curl_rc));
+        snprintf(buf, sizeof(buf), "Ошибка сети: %s%s",
+                 g_req.curl_err[0] ? g_req.curl_err : curl_easy_strerror(g_req.curl_rc),
+                 g_cfg.server[0] ? "\nПроверь, что компьютер включён, мост запущен и Switch в той же сети Wi-Fi." : "");
         if (last_user >= 0) g_msgs[last_user].excluded = true;
         msg_add(ROLE_ERROR, buf);
         return;
@@ -352,7 +362,12 @@ static void request_finish(void) {
         cJSON *m = err ? cJSON_GetObjectItem(err, "message") : NULL;
         if (cJSON_IsString(m)) emsg = m->valuestring;
         const char *hint = "";
-        if (g_req.http_code == 401) hint = "\nПроверь API-ключ (кнопка Y или config.txt).";
+        if (g_cfg.server[0]) {
+            if (g_req.http_code == 401) hint = "\nНеверный server_token в config.txt.";
+        }
+        else if (g_req.http_code == 401) hint = "\nПроверь API-ключ (кнопка Y или config.txt).";
+        else if (g_req.http_code == 400 && emsg && strstr(emsg, "credit balance"))
+            hint = "\nЗакончились кредиты API: пополни баланс на platform.claude.com (Billing) или включи режим через компьютер.";
         else if (g_req.http_code == 404) hint = "\nВозможно, неверное имя модели в config.txt.";
         else if (g_req.http_code == 429) hint = "\nСлишком много запросов или закончились лимиты — подожди немного.";
         else if (g_req.http_code == 529) hint = "\nСерверы перегружены — попробуй ещё раз позже.";
@@ -647,7 +662,7 @@ static void render(u64 frame) {
     if (g_msg_count == 0 && !g_busy) {
         const char *hello1 = "Привет! Нажми A, чтобы написать Claude.";
         draw_text(g_font, hello1, (SCREEN_W - text_w(g_font, hello1)) / 2, SCREEN_H / 2 - 40, (SDL_Color){200, 200, 210, 255});
-        if (!g_cfg.api_key[0]) {
+        if (!g_cfg.api_key[0] && !g_cfg.server[0]) {
             const char *h2 = "Сначала нужен API-ключ: нажми Y или впиши его в";
             const char *h3 = "sdmc:/switch/claude/config.txt";
             draw_text(g_font_small, h2, (SCREEN_W - text_w(g_font_small, h2)) / 2, SCREEN_H / 2 + 10, (SDL_Color){255, 170, 120, 255});
@@ -672,7 +687,8 @@ static void render(u64 frame) {
     fill_rect(0, HEADER_H - 2, SCREEN_W, 2, 217, 119, 87);
     draw_text(g_font_bold, "Claude", MARGIN_X, (HEADER_H - TTF_FontHeight(g_font_bold)) / 2, (SDL_Color){230, 150, 100, 255});
     char mdl[200];
-    snprintf(mdl, sizeof(mdl), "модель: %s", g_cfg.model);
+    if (g_cfg.server[0]) snprintf(mdl, sizeof(mdl), "через компьютер (подписка Claude)");
+    else snprintf(mdl, sizeof(mdl), "модель: %s", g_cfg.model);
     draw_text(g_font_small, mdl, SCREEN_W - MARGIN_X - text_w(g_font_small, mdl),
               (HEADER_H - TTF_FontHeight(g_font_small)) / 2, (SDL_Color){160, 160, 170, 255});
 
@@ -1106,7 +1122,7 @@ static void osk_finish(bool ok) {
 static void send_message(void) {
     if (g_busy) return;
     LOG("A pressed");
-    if (!g_cfg.api_key[0]) {
+    if (!g_cfg.api_key[0] && !g_cfg.server[0]) {
         msg_add(ROLE_ERROR, "Не задан API-ключ. Нажми Y, чтобы ввести его, или впиши api_key=... в sdmc:/switch/claude/config.txt");
         layout_all();
         g_stick_bottom = true;
@@ -1136,7 +1152,7 @@ int main(int argc, char **argv) {
     (void)argc; (void)argv;
 
     remove("sdmc:/switch/claude/log.txt");
-    LOG("claude-nx 1.0.3 start, applet type %d", (int)appletGetAppletType());
+    LOG("claude-nx 1.1.0 start, applet type %d", (int)appletGetAppletType());
 
     Result rc = socketInitializeDefault();
     LOG("socketInitializeDefault: 0x%x", rc);
@@ -1169,7 +1185,7 @@ int main(int argc, char **argv) {
     LOG("input ok");
 
     config_load();
-    LOG("config_load ok, key %s, model %s", g_cfg.api_key[0] ? "set" : "empty", g_cfg.model);
+    LOG("config_load ok, key %s, model %s, server %s", g_cfg.api_key[0] ? "set" : "empty", g_cfg.model, g_cfg.server[0] ? g_cfg.server : "-");
     bool fonts_ok = load_fonts();
     LOG("load_fonts: %d", (int)fonts_ok);
     if (fonts_ok) {
