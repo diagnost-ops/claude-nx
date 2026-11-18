@@ -42,7 +42,7 @@ BUILD		:=	build
 SOURCES		:=	source
 DATA		:=	data
 INCLUDES	:=	include
-ROMFS		:=	romfs
+ROMFS		:=	
 
 APP_TITLE   := Claude
 APP_AUTHOR  := Claude NX
